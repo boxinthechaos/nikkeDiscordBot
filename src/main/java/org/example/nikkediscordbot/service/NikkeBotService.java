@@ -12,7 +12,9 @@ import net.dv8tion.jda.api.interactions.commands.OptionType;
 import net.dv8tion.jda.api.interactions.commands.build.Commands;
 import net.dv8tion.jda.api.requests.GatewayIntent;
 import org.example.nikkediscordbot.entity.BotSetting;
+import org.example.nikkediscordbot.entity.LastNotice;
 import org.example.nikkediscordbot.repository.BotSettingRepository;
+import org.example.nikkediscordbot.repository.LastNoticeRepository;
 import org.jsoup.Jsoup;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
@@ -27,10 +29,12 @@ import java.util.List;
 @EnableScheduling
 public class NikkeBotService extends ListenerAdapter {
     private final BotSettingRepository botSettingRepository;
+    private final LastNoticeRepository lastNoticeRepository;
     private JDA jda;
 
-    public NikkeBotService(BotSettingRepository botSettingRepository) {
+    public NikkeBotService(BotSettingRepository botSettingRepository, LastNoticeRepository lastNoticeRepository) {
         this.botSettingRepository = botSettingRepository;
+        this.lastNoticeRepository = lastNoticeRepository;
     }
 
     @Value("${discord.bot.token}")
@@ -68,10 +72,22 @@ public class NikkeBotService extends ListenerAdapter {
             JsonNode feedNode = mapper.readTree(jsonBody)
                     .path("content").path("feeds").get(0).path("feed");
             String feedId = feedNode.path("feedId").asText("");
-            lastNoticeLink = "https://game.naver.com/lounge/nikke/board/detail/" + feedId;
-            System.out.println("✅ 초기 공지 ID 저장 완료: " + lastNoticeLink);
+            String latestLink = "https://game.naver.com/lounge/nikke/board/detail/" + feedId;
+
+            // DB에 저장된 url 있으면 복원, 없으면 최신 url 저장
+            lastNoticeRepository.findAll().stream().findFirst().ifPresentOrElse(
+                    saved -> {
+                        lastNoticeLink = saved.getUrl();
+                        System.out.println("✅ DB에서 마지막 공지 복원: " + lastNoticeLink);
+                    },
+                    () -> {
+                        lastNoticeRepository.save(new LastNotice(latestLink));
+                        lastNoticeLink = latestLink;
+                        System.out.println("✅ 초기 공지 URL DB 저장 완료: " + lastNoticeLink);
+                    }
+            );
         } catch (Exception e) {
-            System.out.println("⚠️ 초기 공지 ID 저장 실패: " + e.getMessage());
+            System.out.println("⚠️ 초기 공지 URL 저장 실패: " + e.getMessage());
         }
 
         jda.updateCommands().addCommands(
@@ -214,9 +230,18 @@ public class NikkeBotService extends ListenerAdapter {
             String feedId = feedNode.path("feedId").asText("");
             String link = "https://game.naver.com/lounge/nikke/board/detail/" + feedId;
 
-            // 이전에 보낸 글과 같으면 무시
-            if (link.equals(lastNoticeLink)) return;
-            lastNoticeLink = link;
+            String lastLink = lastNoticeRepository.findAll().stream()
+                    .findFirst()
+                    .map(LastNotice::getUrl)
+                    .orElse("");
+
+            if (link.equals(lastLink)) {
+                System.out.println("🔄 새 공지 없음");
+                return;
+            }
+
+            lastNoticeRepository.deleteAll();
+            lastNoticeRepository.save(new LastNotice(link));
 
             String title = org.jsoup.parser.Parser.unescapeEntities(
                     feedNode.path("title").asText("제목 없음"), false);
@@ -262,7 +287,7 @@ public class NikkeBotService extends ListenerAdapter {
                             jda.getTextChannelById(setting.getChannelId());
                     if (channel == null) {
                         System.out.println("채널 못 찾음: " + setting.getChannelId());
-                        return;
+                        continue;
                     }
                     channel.sendMessageEmbeds(embed.build()).queue();
                 } catch (Exception e) {
