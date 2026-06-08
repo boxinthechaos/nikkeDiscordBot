@@ -30,23 +30,21 @@ import java.util.List;
 public class NikkeBotService extends ListenerAdapter {
     private final BotSettingRepository botSettingRepository;
     private final LastNoticeRepository lastNoticeRepository;
+    private final ObjectMapper mapper = new ObjectMapper(); // 추가
     private JDA jda;
-
-    public NikkeBotService(BotSettingRepository botSettingRepository, LastNoticeRepository lastNoticeRepository) {
-        this.botSettingRepository = botSettingRepository;
-        this.lastNoticeRepository = lastNoticeRepository;
-    }
 
     @Value("${discord.bot.token}")
     private String botToken;
 
-    private String lastNoticeLink = "";
+    // 추가
+    private static final int BOARD_NOTICE = 56;
+    private static final int BOARD_UPDATE = 48;
 
-    // 네이버 라운지 게시판 기본 링크
-    private final String NIKKE_LOUNGE_URL = "https://game.naver.com/lounge/nikke/board/56";
-
-    // 💡 네이버가 실제로 글 목록 데이터를 가져오는 API 주소 (boardId 56 기준)
-    private final String NAVER_API_URL = "https://comm-api.game.naver.com/nng_main/v1/lounge/nikke/board/56/list?limit=5";
+    public NikkeBotService(BotSettingRepository botSettingRepository,
+                           LastNoticeRepository lastNoticeRepository) {
+        this.botSettingRepository = botSettingRepository;
+        this.lastNoticeRepository = lastNoticeRepository;
+    }
 
     @EventListener(ApplicationReadyEvent.class)
     public void startBot() throws InterruptedException {
@@ -54,46 +52,33 @@ public class NikkeBotService extends ListenerAdapter {
                 .enableIntents(GatewayIntent.GUILD_MESSAGES, GatewayIntent.MESSAGE_CONTENT)
                 .addEventListeners(this)
                 .build();
-
         jda.awaitReady();
         System.out.println("🤖 니케 MySQL 멀티서버 알림 봇이 구동되었습니다!");
 
-        // ✅ 이 부분 추가 - 봇 시작 시 최신 글 ID를 미리 저장해서 중복 전송 방지
-        try {
-            String apiUrl = "https://comm-api.game.naver.com/nng_main/v1/community/lounge/nikke/feed"
-                    + "?boardId=56&buffFilteringYN=N&limit=1&offset=0&order=NEW";
-            String jsonBody = Jsoup.connect(apiUrl)
-                    .header("User-Agent", "Mozilla/5.0")
-                    .ignoreContentType(true)
-                    .timeout(30000)
-                    .execute()
-                    .body();
-            ObjectMapper mapper = new ObjectMapper();
-            JsonNode feedNode = mapper.readTree(jsonBody)
-                    .path("content").path("feeds").get(0).path("feed");
-            String feedId = feedNode.path("feedId").asText("");
-            String latestLink = "https://game.naver.com/lounge/nikke/board/detail/" + feedId;
+        // 두 게시판 초기화
+        for (int boardId : new int[]{BOARD_NOTICE, BOARD_UPDATE}) {
+            try {
+                JsonNode feedNode = fetchFeedNode(boardId);
+                String latestLink = "https://game.naver.com/lounge/nikke/board/detail/"
+                        + feedNode.path("feedId").asText("");
 
-            // DB에 저장된 url 있으면 복원, 없으면 최신 url 저장
-            lastNoticeRepository.findAll().stream().findFirst().ifPresentOrElse(
-                    saved -> {
-                        lastNoticeLink = saved.getUrl();
-                        System.out.println("✅ DB에서 마지막 공지 복원: " + lastNoticeLink);
-                    },
-                    () -> {
-                        lastNoticeRepository.save(new LastNotice(latestLink));
-                        lastNoticeLink = latestLink;
-                        System.out.println("✅ 초기 공지 URL DB 저장 완료: " + lastNoticeLink);
-                    }
-            );
-        } catch (Exception e) {
-            System.out.println("⚠️ 초기 공지 URL 저장 실패: " + e.getMessage());
+                lastNoticeRepository.findByBoardId(boardId).ifPresentOrElse(
+                        saved -> System.out.println("✅ DB 복원 [" + boardId + "]: " + saved.getUrl()),
+                        () -> {
+                            lastNoticeRepository.save(new LastNotice(boardId, latestLink));
+                            System.out.println("✅ 초기 저장 [" + boardId + "]: " + latestLink);
+                        }
+                );
+            } catch (Exception e) {
+                System.out.println("⚠️ 초기화 실패 [" + boardId + "]: " + e.getMessage());
+            }
         }
 
         jda.updateCommands().addCommands(
                 Commands.slash("공지채널설정", "니케 공지사항을 받을 채널을 지정합니다.")
                         .addOption(OptionType.CHANNEL, "채널", "공지를 받을 텍스트 채널을 선택하세요.", true)
                         .setDefaultPermissions(DefaultMemberPermissions.enabledFor(Permission.MANAGE_SERVER)),
+                Commands.slash("공지사항", "가장 최근 니케 공지사항을 확인합니다."), // 추가
                 Commands.slash("업데이트", "가장 최근 니케 업데이트 공지를 확인합니다.")
         ).queue();
     }
@@ -101,204 +86,156 @@ public class NikkeBotService extends ListenerAdapter {
     @Override
     public void onSlashCommandInteraction(SlashCommandInteractionEvent event) {
         if (event.getName().equals("공지채널설정")) {
-            // ... (기존 공지채널설정 코드는 그대로 둡니다) ...
             if (event.getGuild() == null) {
                 event.reply("서버 내에서만 사용할 수 있는 명령어입니다.").setEphemeral(true).queue();
                 return;
             }
-
             String guildId = event.getGuild().getId();
             String channelId = event.getOption("채널").getAsChannel().getId();
-
-            BotSetting setting = new BotSetting(guildId, channelId);
-            botSettingRepository.save(setting);
-
+            botSettingRepository.save(new BotSetting(guildId, channelId));
             event.reply("✅ 지정하신 채널로 니케 공지사항을 안전하게 배달해 드릴게요! 🫡")
-                    .setEphemeral(true)
-                    .queue();
+                    .setEphemeral(true).queue();
         }
 
-        // 💡 여기서부터 변경된 플랜 B 크롤링 코드입니다!
-        if (event.getName().equals("업데이트")) {
+        // /공지사항 - boardId 56
+        if (event.getName().equals("공지사항")) {
             event.deferReply().queue();
-
             try {
-                String apiUrl = "https://comm-api.game.naver.com/nng_main/v1/community/lounge/nikke/feed"
-                        + "?boardId=56&buffFilteringYN=N&limit=1&offset=0&order=NEW";
-
-                String jsonBody = Jsoup.connect(apiUrl)
-                        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-                        .header("Accept", "application/json, text/plain, */*")
-                        .header("Accept-Language", "ko-KR,ko;q=0.9")
-                        .header("Referer", "https://game.naver.com/lounge/nikke/board/56")
-                        .header("Origin", "https://game.naver.com")
-                        .ignoreContentType(true)
-                        .timeout(10000)
-                        .execute()
-                        .body();
-
-                ObjectMapper mapper = new ObjectMapper();
-                JsonNode root = mapper.readTree(jsonBody);
-                JsonNode feedNode = root.path("content").path("feeds").get(0).path("feed");
-
-                // 제목
-                String title = org.jsoup.parser.Parser.unescapeEntities(
-                        feedNode.path("title").asText("제목 없음"), false);
-
-                // 링크
-                String feedId = feedNode.path("feedId").asText("");
-                String link = "https://game.naver.com/lounge/nikke/board/detail/" + feedId;
-
-                // 이미지
-                String imageUrl = feedNode.path("repImageUrl").asText("");
-
-                // 내용 추출 (contents JSON 안의 텍스트 노드들을 이어붙임)
-                String contentsRaw = feedNode.path("contents").asText("");
-                StringBuilder bodyText = new StringBuilder();
-                if (!contentsRaw.isEmpty()) {
-                    JsonNode contentsJson = mapper.readTree(contentsRaw);
-                    JsonNode components = contentsJson.path("document").path("components");
-                    for (JsonNode component : components) {
-                        JsonNode value = component.path("value");
-                        if (value.isArray()) {
-                            for (JsonNode paragraph : value) {
-                                JsonNode nodes = paragraph.path("nodes");
-                                if (nodes.isArray()) {
-                                    for (JsonNode node : nodes) {
-                                        String text = node.path("value").asText("").trim();
-                                        if (!text.isEmpty()) {
-                                            bodyText.append(text).append("\n");
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // 내용이 너무 길면 자르기 (Discord Embed 최대 4096자)
-                String body = bodyText.toString().trim();
-                if (body.length() > 800) {
-                    body = body.substring(0, 800) + "...\n\n더 보기: " + link;
-                } else if (body.isEmpty()) {
-                    body = "내용 없음";
-                }
-
-                // Discord Embed 전송
-                net.dv8tion.jda.api.EmbedBuilder embed = new net.dv8tion.jda.api.EmbedBuilder()
-                        .setTitle("📢 " + title, link)
-                        .setDescription(body)
-                        .setColor(0x00AAFF);
-
-                if (!imageUrl.isEmpty()) {
-                    embed.setImage(imageUrl);
-                }
-
-                event.getHook().sendMessageEmbeds(embed.build()).queue();
-
-            } catch (org.jsoup.HttpStatusException se) {
-                event.getHook().sendMessage("❌ HTTP " + se.getStatusCode() + " 에러").queue();
-                se.printStackTrace();
+                JsonNode feedNode = fetchFeedNode(BOARD_NOTICE);
+                event.getHook().sendMessageEmbeds(buildEmbed(feedNode, BOARD_NOTICE).build()).queue();
             } catch (Exception e) {
                 event.getHook().sendMessage("❌ 에러: " + e.getMessage()).queue();
-                e.printStackTrace();
+            }
+        }
+
+        // /업데이트 - boardId 48 (기존과 동일한 구조, boardId만 변경)
+        if (event.getName().equals("업데이트")) {
+            event.deferReply().queue();
+            try {
+                JsonNode feedNode = fetchFeedNode(BOARD_UPDATE);
+                event.getHook().sendMessageEmbeds(buildEmbed(feedNode, BOARD_UPDATE).build()).queue();
+            } catch (Exception e) {
+                event.getHook().sendMessage("❌ 에러: " + e.getMessage()).queue();
             }
         }
     }
-    @Scheduled(fixedDelay = 120000) // 2분마다 실행
+
+    @Scheduled(fixedDelay = 120000)
     public void checkNewNotice() {
         if (jda == null) return;
+        checkBoard(BOARD_NOTICE); // 추가
+        checkBoard(BOARD_UPDATE);
+    }
+
+    // 기존 로직 그대로, boardId 파라미터만 추가
+    private void checkBoard(int boardId) {
         try {
-            String apiUrl = "https://comm-api.game.naver.com/nng_main/v1/community/lounge/nikke/feed"
-                    + "?boardId=56&buffFilteringYN=N&limit=1&offset=0&order=NEW";
-
-            String jsonBody = Jsoup.connect(apiUrl)
-                    .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-                    .header("Accept", "application/json, text/plain, */*")
-                    .header("Accept-Language", "ko-KR,ko;q=0.9")
-                    .header("Referer", "https://game.naver.com/lounge/nikke/board/56")
-                    .header("Origin", "https://game.naver.com")
-                    .ignoreContentType(true)
-                    .timeout(10000)
-                    .execute()
-                    .body();
-
-            ObjectMapper mapper = new ObjectMapper();
-            JsonNode root = mapper.readTree(jsonBody);
-            JsonNode feedNode = root.path("content").path("feeds").get(0).path("feed");
-
+            JsonNode feedNode = fetchFeedNode(boardId);
             String feedId = feedNode.path("feedId").asText("");
             String link = "https://game.naver.com/lounge/nikke/board/detail/" + feedId;
 
-            String lastLink = lastNoticeRepository.findAll().stream()
-                    .findFirst()
+            String lastLink = lastNoticeRepository.findByBoardId(boardId)
                     .map(LastNotice::getUrl)
                     .orElse("");
 
             if (link.equals(lastLink)) {
-                System.out.println("🔄 새 공지 없음");
+                System.out.println("🔄 새 공지 없음 [boardId=" + boardId + "]");
                 return;
             }
 
-            lastNoticeRepository.deleteAll();
-            lastNoticeRepository.save(new LastNotice(link));
+            // DB 업데이트
+            LastNotice record = lastNoticeRepository.findByBoardId(boardId)
+                    .orElse(new LastNotice(boardId, link));
+            record.setUrl(link);
+            lastNoticeRepository.save(record);
 
-            String title = org.jsoup.parser.Parser.unescapeEntities(
-                    feedNode.path("title").asText("제목 없음"), false);
-            String imageUrl = feedNode.path("repImageUrl").asText("");
-
-            // 내용 추출
-            String contentsRaw = feedNode.path("contents").asText("");
-            StringBuilder bodyText = new StringBuilder();
-            if (!contentsRaw.isEmpty()) {
-                JsonNode contentsJson = mapper.readTree(contentsRaw);
-                JsonNode components = contentsJson.path("document").path("components");
-                for (JsonNode component : components) {
-                    JsonNode value = component.path("value");
-                    if (value.isArray()) {
-                        for (JsonNode paragraph : value) {
-                            JsonNode nodes = paragraph.path("nodes");
-                            if (nodes.isArray()) {
-                                for (JsonNode node : nodes) {
-                                    String text = node.path("value").asText("").trim();
-                                    if (!text.isEmpty()) bodyText.append(text).append("\n");
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            String body = bodyText.toString().trim();
-            if (body.length() > 800) body = body.substring(0, 800) + "...\n\n더 보기: " + link;
-            if (body.isEmpty()) body = "내용 없음";
-
-            // DB에서 설정된 모든 서버 채널에 전송
-            net.dv8tion.jda.api.EmbedBuilder embed = new net.dv8tion.jda.api.EmbedBuilder()
-                    .setTitle("📢 " + title, link)
-                    .setDescription(body)
-                    .setColor(0x00AAFF);
-            if (!imageUrl.isEmpty()) embed.setImage(imageUrl);
-
+            // 임베드 전송
+            net.dv8tion.jda.api.EmbedBuilder embed = buildEmbed(feedNode, boardId);
             List<BotSetting> settings = botSettingRepository.findAll();
             for (BotSetting setting : settings) {
                 try {
                     net.dv8tion.jda.api.entities.channel.concrete.TextChannel channel =
                             jda.getTextChannelById(setting.getChannelId());
-                    if (channel == null) {
-                        System.out.println("채널 못 찾음: " + setting.getChannelId());
-                        continue;
-                    }
+                    if (channel == null) continue;
                     channel.sendMessageEmbeds(embed.build()).queue();
                 } catch (Exception e) {
                     System.out.println("채널 전송 실패: " + setting.getChannelId());
                 }
             }
-
-            System.out.println("✅ 새 공지 전송 완료: " + title);
+            System.out.println("✅ 새 공지 전송 완료 [boardId=" + boardId + "]: "
+                    + feedNode.path("title").asText());
 
         } catch (Exception e) {
-            System.out.println("❌ 스케줄러 에러: " + e.getMessage());
+            System.out.println("❌ 스케줄러 에러 [boardId=" + boardId + "]: " + e.getMessage());
         }
+    }
+
+    // ── 공통 유틸 (중복 제거용) ──────────────────────
+    private JsonNode fetchFeedNode(int boardId) throws Exception {
+        String apiUrl = "https://comm-api.game.naver.com/nng_main/v1/community/lounge/nikke/feed"
+                + "?boardId=" + boardId + "&buffFilteringYN=N&limit=1&offset=0&order=NEW";
+
+        String jsonBody = Jsoup.connect(apiUrl)
+                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+                .header("Accept", "application/json, text/plain, */*")
+                .header("Accept-Language", "ko-KR,ko;q=0.9")
+                .header("Referer", "https://game.naver.com/lounge/nikke/board/" + boardId)
+                .header("Origin", "https://game.naver.com")
+                .ignoreContentType(true)
+                .timeout(10000)
+                .execute()
+                .body();
+
+        return mapper.readTree(jsonBody)
+                .path("content").path("feeds").get(0).path("feed");
+    }
+
+    private net.dv8tion.jda.api.EmbedBuilder buildEmbed(JsonNode feedNode, int boardId) throws Exception {
+        String title = org.jsoup.parser.Parser.unescapeEntities(
+                feedNode.path("title").asText("제목 없음"), false);
+        String feedId = feedNode.path("feedId").asText("");
+        String link = "https://game.naver.com/lounge/nikke/board/detail/" + feedId;
+        String imageUrl = feedNode.path("repImageUrl").asText("");
+        String body = parseBody(feedNode, link);
+
+        String emoji = boardId == BOARD_UPDATE ? "🔧" : "📢";
+        int color  = boardId == BOARD_UPDATE ? 0xFF6B00 : 0x00AAFF;
+
+        net.dv8tion.jda.api.EmbedBuilder embed = new net.dv8tion.jda.api.EmbedBuilder()
+                .setTitle(emoji + " " + title, link)
+                .setDescription(body)
+                .setColor(color);
+
+        if (!imageUrl.isEmpty()) embed.setImage(imageUrl);
+        return embed;
+    }
+
+    private String parseBody(JsonNode feedNode, String link) throws Exception {
+        String contentsRaw = feedNode.path("contents").asText("");
+        StringBuilder bodyText = new StringBuilder();
+
+        if (!contentsRaw.isEmpty()) {
+            JsonNode components = mapper.readTree(contentsRaw)
+                    .path("document").path("components");
+            for (JsonNode component : components) {
+                JsonNode value = component.path("value");
+                if (value.isArray()) {
+                    for (JsonNode paragraph : value) {
+                        JsonNode nodes = paragraph.path("nodes");
+                        if (nodes.isArray()) {
+                            for (JsonNode node : nodes) {
+                                String text = node.path("value").asText("").trim();
+                                if (!text.isEmpty()) bodyText.append(text).append("\n");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        String body = bodyText.toString().trim();
+        if (body.length() > 800) body = body.substring(0, 800) + "...\n\n더 보기: " + link;
+        if (body.isEmpty()) body = "내용 없음";
+        return body;
     }
 }
